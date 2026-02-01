@@ -8,7 +8,7 @@ def fetch_api_source(api_name):
     return response.json()
 
 if __name__ == "__main__":
-    api_name = "get_users"
+    api_name = "login"
     data = fetch_api_source(api_name)
 
     print("API Name:", data["api_name"])

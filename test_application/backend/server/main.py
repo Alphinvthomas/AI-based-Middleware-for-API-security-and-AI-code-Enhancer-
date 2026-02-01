@@ -1,12 +1,14 @@
 from fastapi import FastAPI, HTTPException
 import inspect
-from apis import user_api, payment_api
+from apis import user_api, payment_api, login_api
+from pydantic import BaseModel
 
 app = FastAPI(title="API Source Registry Server")
 
 API_REGISTRY = {
     "get_users": user_api.get_users,
-    "process_payment": payment_api.process_payment
+    "process_payment": payment_api.process_payment,
+    "login": login_api.login
 }
 
 @app.get("/api/{api_name}")
@@ -25,3 +27,7 @@ def get_api_source(api_name: str):
         "api_name": api_name,
         "source_code": source_code
     }
+
+@app.post("/login")
+def login_endpoint(data):
+    return login_api.login(data)
