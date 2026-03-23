@@ -1,6 +1,7 @@
 import requests
 import os
 import re
+from typing import Optional
 from dotenv import load_dotenv
 from flask import Flask, jsonify, request
 from flask_cors import CORS
@@ -95,27 +96,73 @@ def get_security_score(source_code: str):
 # ==================================================
 # Generate Secure Code Suggestion
 # ==================================================
-def get_secure_code_suggestion(source_code: str):
+PROJECT_CONTEXT = """
+PROJECT STRUCTURE:
+- Main server file (main.py) uses FastAPI with a registry pattern
+- APIs are registered in API_REGISTRY dictionary
+- Each API is a function in apis/ folder
+- Functions return simple dictionaries (not FastAPI responses)
+- The main.py inspect.getsource() retrieves function source code
+
+EXISTING main.py PATTERN:
+```python
+from fastapi import FastAPI, HTTPException
+import inspect
+from apis import user_api, payment_api, login_api, order_api
+from pydantic import BaseModel
+
+app = FastAPI(title="API Source Registry Server")
+
+API_REGISTRY = {
+    "api_name": {"func": module.function, "method": "GET/POST/PUT/DELETE"},
+}
+
+@app.get("/source/{api_name}")
+def get_api_source(api_name: str):
+    if api_name not in API_REGISTRY:
+        raise HTTPException(status_code=404, detail="API not found")
+    source_code = inspect.getsource(API_REGISTRY[api_name]["func"])
+    return {"api_name": api_name, "source_code": source_code}
+```
+
+REQUIREMENTS:
+1. Output ONLY valid Python code - a single function that can replace the original
+2. The function should return a simple dict (not FastAPI response objects)
+3. Include necessary imports at the top of the function
+4. Implement: input validation, error handling, authentication placeholder
+5. Do NOT use hardcoded credentials - use environment variables
+6. Do NOT create FastAPI app or routes - just the function
+7. If external dependencies needed, add: ###EXTERNAL_DEPENDENCIES### and list pip packages
+8. Do NOT add explanations - ONLY code
+
+Example output format:
+```python
+def api_function():
+    # imports
+    # validation
+    # logic
+    return {"result": "value"}
+```
+"""
+
+def get_secure_code_suggestion(source_code: str, api_name: Optional[str] = None):
     headers = {
         "Authorization": f"Bearer {GROQ_API_KEY}",
         "Content-Type": "application/json"
     }
 
-    prompt = f"""
-    You are a senior backend security engineer.
-    Rewrite the following API to make it secure.
-    Improve:
-    - Input validation
-    - Authentication logic
-    - Proper error handling
-    - Avoid hardcoded credentials
-    - Follow secure coding best practices
+    prompt = f"""You are a senior backend security engineer.
 
-    Return only the improved Python code.
+Analyze the following API function and rewrite it to be secure.
 
-    Code:
-    {source_code}
-    """
+{PROJECT_CONTEXT}
+
+API NAME: {api_name if api_name else "Unknown"}
+
+Original Code to Secure:
+{source_code}
+
+Generate the SECURE version of this function:"""
 
     payload = {
         "model": MODEL_NAME,
@@ -126,16 +173,36 @@ def get_secure_code_suggestion(source_code: str):
     }
 
     try:
-        response = requests.post(GROQ_URL, headers=headers, json=payload, timeout=30)
+        response = requests.post(GROQ_URL, headers=headers, json=payload, timeout=60)
         if response.status_code == 200:
             result = response.json()
-            return result["choices"][0]["message"]["content"].strip()
+            content = result["choices"][0]["message"]["content"].strip()
+            
+            if "###EXTERNAL_DEPENDENCIES###" in content:
+                parts = content.split("###EXTERNAL_DEPENDENCIES###")
+                code = parts[0].strip()
+                dependencies_raw = parts[1].strip() if len(parts) > 1 else ""
+                
+                dependencies = []
+                if dependencies_raw:
+                    for line in dependencies_raw.split('\n'):
+                        line = line.strip()
+                        if line.startswith('- ') or line.startswith('* '):
+                            dependencies.append(line[2:].strip())
+                        elif line.startswith('pip ') or line.startswith('pip install '):
+                            dependencies.append(line.replace('pip install ', '').replace('pip ', '').strip())
+                        elif line and not line.startswith('#'):
+                            dependencies.append(line.strip())
+                
+                return {"code": code, "dependencies": dependencies}
+            else:
+                return {"code": content, "dependencies": []}
         else:
             print("Secure Code API Error:", response.status_code)
-            return "Secure code generation failed."
+            return {"code": "Secure code generation failed.", "dependencies": []}
     except Exception as e:
         print(f"Error generating secure code: {e}")
-        return f"Error: {str(e)}"
+        return {"code": f"Error: {str(e)}", "dependencies": []}
 
 
 # ==================================================
@@ -202,15 +269,19 @@ def analyze_api(api_name):
         
         # Generate suggested code if score is low
         suggested_code = None
+        suggested_dependencies = []
         if score < 70:
-            suggested_code = get_secure_code_suggestion(source_code)
+            result = get_secure_code_suggestion(source_code, api_name)
+            suggested_code = result.get("code", "")
+            suggested_dependencies = result.get("dependencies", [])
         
         return jsonify({
             "api_name": api_name,
-            "endpoint": f"/api/v1/{api_name}",  # You can customize this
+            "endpoint": f"/api/v1/{api_name}",
             "source_code": source_code,
             "security_score": score,
             "suggested_code": suggested_code,
+            "suggested_dependencies": suggested_dependencies,
             "needs_improvement": score < 70,
             "severity": "Critical" if score < 50 else "High" if score < 70 else "Medium" if score < 85 else "Low"
         }), 200
