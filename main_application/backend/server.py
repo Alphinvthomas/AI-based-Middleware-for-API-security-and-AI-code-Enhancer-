@@ -31,6 +31,18 @@ def fetch_api_source(api_name):
 
 
 # ==================================================
+# Fetch API List from Test Server
+# ==================================================
+def fetch_api_list():
+    try:
+        response = requests.get(f"{SERVER_A_URL}/api/list")
+        response.raise_for_status()
+        return response.json()
+    except Exception as e:
+        return {"error": str(e), "apis": []}
+
+
+# ==================================================
 # Extract numeric score safely
 # ==================================================
 def extract_score(text):
@@ -129,6 +141,32 @@ def get_secure_code_suggestion(source_code: str):
 # ==================================================
 # API Endpoints
 # ==================================================
+
+@app.route('/api/list', methods=['GET'])
+def list_apis():
+    """
+    Returns the list of available APIs from the test server with security scores.
+    """
+    data = fetch_api_list()
+    if "error" in data and not data.get("apis"):
+        return jsonify({"error": data["error"], "apis": []}), 200
+    
+    apis = data.get("apis", [])
+    
+    for api in apis:
+        api_name = api.get("apiKey")
+        if api_name:
+            source_data = fetch_api_source(api_name)
+            if "source_code" in source_data:
+                score = get_security_score(source_data["source_code"])
+                api["score"] = score if score else 0
+                api["status"] = "Active" if score and score >= 60 else "Danger"
+            else:
+                api["score"] = 0
+                api["status"] = "Danger"
+    
+    return jsonify({"apis": apis}), 200
+
 
 @app.route('/api/analyze/<api_name>', methods=['GET'])
 def analyze_api(api_name):
