@@ -1,244 +1,515 @@
-import requests
+"""
+AI Security Middleware Server
+Fetches APIs from GitHub, analyzes them, and detects input threats
+"""
 import os
+import sys
 import re
-from typing import Optional
-from dotenv import load_dotenv
+from typing import Optional, Dict, List
+from pathlib import Path
+
+# Load environment variables from root .env file FIRST
+env_path = Path(__file__).parent.parent.parent / '.env'
+if env_path.exists():
+    with open(env_path, 'r', encoding='utf-8-sig') as f:  # utf-8-sig removes BOM
+        for line in f:
+            line = line.strip()
+            if line and '=' in line and not line.startswith('#'):
+                key, value = line.split('=', 1)
+                key = key.strip().replace('\ufeff', '')  # Remove any BOM characters
+                value = value.strip()
+                if key:
+                    os.environ[key] = value
+    print(f"✅ Loaded environment from {env_path}")
+
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 
-load_dotenv()
+from github_integration import GitHubIntegration
+from api_analyzer import APIAnalyzer, DiscoveredAPI
+from threat_detector import ThreatDetector, ThreatLevel, ThreatDetectedError
 
-# 🔐 Use environment variable instead of hardcoding
+# ================================================================================
+# Configuration
+# ================================================================================
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
+GITHUB_REPO_OWNER = os.getenv("GITHUB_REPO_OWNER", "default_owner")
+GITHUB_REPO_NAME = os.getenv("GITHUB_REPO_NAME", "default_repo")
 
-SERVER_A_URL = "http://localhost:8000"
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 MODEL_NAME = "llama-3.1-8b-instant"
 
+# ================================================================================
+# Middleware Configuration
+# ================================================================================
+# URL of the actual backend API (e.g., RentMate backend)
+ACTUAL_BACKEND_URL = os.getenv("ACTUAL_BACKEND_URL", "http://localhost:3000")
+
+print(f"🔗 Actual Backend: {ACTUAL_BACKEND_URL}")
+
 app = Flask(__name__)
-CORS(app)  # Enable CORS for frontend communication
+CORS(app)
+
+# Global state
+github_client = None
+api_analyzer = APIAnalyzer()
+threat_detector = ThreatDetector(strict_mode=True)
+cached_apis: List[DiscoveredAPI] = []
+cached_file_contents: Dict[str, str] = {}
 
 
-# ==================================================
-# Fetch API Source from Test Server
-# ==================================================
-def fetch_api_source(api_name):
+# ================================================================================
+# GitHub and API Discovery Functions
+# ================================================================================
+
+def initialize_github_client(owner: str, repo_name: str) -> Optional[GitHubIntegration]:
+    """
+    Initialize GitHub integration client
+    
+    Args:
+        owner: Repository owner
+        repo_name: Repository name
+        
+    Returns:
+        GitHubIntegration instance or None if failed
+    """
     try:
-        response = requests.get(f"{SERVER_A_URL}/source/{api_name}")
-        response.raise_for_status()
-        return response.json()
+        client = GitHubIntegration(owner, repo_name)
+        repo_info = client.get_repository_structure()
+        if repo_info:
+            print(f"✅ Connected to GitHub repo: {owner}/{repo_name}")
+            return client
+        else:
+            print(f"❌ Failed to access GitHub repo: {owner}/{repo_name}")
+            return None
     except Exception as e:
-        return {"error": str(e)}
+        print(f"❌ GitHub initialization error: {e}")
+        return None
 
 
-# ==================================================
-# Fetch API List from Test Server
-# ==================================================
-def fetch_api_list():
+def discover_apis_from_github(owner: str, repo_name: str) -> List[DiscoveredAPI]:
+    """
+    Discover APIs from GitHub repository (all supported languages)
+    
+    Args:
+        owner: Repository owner
+        repo_name: Repository name
+        
+    Returns:
+        List of discovered APIs
+    """
+    global github_client, cached_apis, cached_file_contents
+    
     try:
-        response = requests.get(f"{SERVER_A_URL}/api/list")
-        response.raise_for_status()
-        return response.json()
+        # Initialize client if not already done
+        if github_client is None or github_client.repo_owner != owner or github_client.repo_name != repo_name:
+            github_client = initialize_github_client(owner, repo_name)
+        
+        if github_client is None:
+            print("❌ GitHub client not initialized")
+            return []
+        
+        # Get all code files from the repository (all supported languages)
+        print("📂 Fetching code files from GitHub...")
+        code_files = github_client.get_all_code_files()
+        
+        if not code_files:
+            print("⚠️ No code files found in repository")
+            return []
+        
+        print(f"📄 Found {len(code_files)} code files")
+        
+        # Fetch file contents
+        cached_file_contents = {}
+        for file_path in code_files:
+            content = github_client.get_file_content(file_path)
+            if content:
+                cached_file_contents[file_path] = content
+        
+        print(f"✅ Fetched {len(cached_file_contents)} files with content")
+        
+        # Analyze files for APIs
+        print("🔍 Analyzing files for APIs...")
+        cached_apis = api_analyzer.discover_apis_in_project(cached_file_contents)
+        
+        print(f"✨ Discovered {len(cached_apis)} APIs")
+        
+        return cached_apis
+    
     except Exception as e:
-        return {"error": str(e), "apis": []}
+        print(f"❌ Error discovering APIs: {e}")
+        return []
 
 
-# ==================================================
-# Extract numeric score safely
-# ==================================================
-def extract_score(text):
+def get_api_source_code(api_name: str) -> Optional[str]:
+    """
+    Get source code of a specific API
+    
+    Args:
+        api_name: API name or endpoint
+        
+    Returns:
+        Source code or None if not found
+    """
+    api = api_analyzer.get_api_by_name(api_name)
+    if api:
+        return api.source_code
+    return None
+
+
+# ================================================================================
+# Input Validation and Threat Detection
+# ================================================================================
+
+def validate_request_input(data: Dict) -> tuple[bool, str, Dict]:
+    """
+    Validate and check request input for threats
+    
+    Args:
+        data: Request data
+        
+    Returns:
+        Tuple of (is_safe, message, details)
+    """
+    if not data:
+        return True, "No data to validate", {}
+    
+    try:
+        is_safe, threat_level, threats = threat_detector.analyze_input(data)
+        
+        if not is_safe:
+            threat_details = {
+                "threat_level": threat_level.value,
+                "threats_detected": len(threats),
+                "threat_list": threats[:5]  # Return top 5 threats
+            }
+            
+            message = f"🚨 SECURITY THREAT DETECTED ({threat_level.value}): Operation blocked"
+            
+            return False, message, threat_details
+        
+        return True, "Input validation passed", {}
+    
+    except Exception as e:
+        return False, f"Validation error: {str(e)}", {}
+
+
+# ================================================================================
+# Security Analysis Functions
+# ================================================================================
+
+def extract_score(text: str) -> int:
+    """Extract numeric score from text"""
     match = re.search(r'\d+', text)
     if match:
         return int(match.group())
     return 0
 
 
-# ==================================================
-# Get Security Score from LLM
-# ==================================================
-def get_security_score(source_code: str):
-    headers = {
-        "Authorization": f"Bearer {GROQ_API_KEY}",
-        "Content-Type": "application/json"
-    }
-
-    prompt = f"""
-    You are a cybersecurity expert.
-    Analyze the following API source code and give a security score from 1 to 100.
-    Only return a number.
-
-    Code:
-    {source_code}
+def get_security_score(source_code: str) -> Optional[int]:
     """
-
-    payload = {
-        "model": MODEL_NAME,
-        "messages": [
-            {"role": "user", "content": prompt}
-        ],
-        "temperature": 0
-    }
-
+    Get security score from LLM
+    
+    Args:
+        source_code: Code to analyze
+        
+    Returns:
+        Security score (0-100) or None if failed
+    """
     try:
+        # If no API key, return default score based on code analysis
+        if not GROQ_API_KEY:
+            print("⚠️ GROQ_API_KEY not set, using default scoring")
+            # Simple heuristic scoring when API key unavailable
+            if len(source_code) < 50:
+                return 50
+            if "password" in source_code.lower() and "input" in source_code.lower():
+                return 40
+            if "sql" in source_code.lower() and "format" in source_code.lower():
+                return 35
+            return 60  # Default moderate score
+        
+        import requests
+        
+        headers = {
+            "Authorization": f"Bearer {GROQ_API_KEY}",
+            "Content-Type": "application/json"
+        }
+        
+        prompt = f"""You are a cybersecurity expert.
+Analyze the following API source code and give a security score from 1 to 100.
+Only return a number.
+
+Code:
+{source_code}"""
+        
+        payload = {
+            "model": MODEL_NAME,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0
+        }
+        
         response = requests.post(GROQ_URL, headers=headers, json=payload, timeout=30)
         if response.status_code == 200:
             result = response.json()
             score_text = result["choices"][0]["message"]["content"]
             return extract_score(score_text)
         else:
-            print("Score API Error:", response.status_code)
-            return None
+            print(f"Score API Error: {response.status_code}")
+            return 60  # Return default score on API error
+    
     except Exception as e:
         print(f"Error getting security score: {e}")
-        return None
+        return 60  # Return default score on exception
 
 
-# ==================================================
-# Generate Secure Code Suggestion
-# ==================================================
-PROJECT_CONTEXT = """
-PROJECT STRUCTURE:
-- Main server file (main.py) uses FastAPI with a registry pattern
-- APIs are registered in API_REGISTRY dictionary
-- Each API is a function in apis/ folder
-- Functions return simple dictionaries (not FastAPI responses)
-- The main.py inspect.getsource() retrieves function source code
-
-EXISTING main.py PATTERN:
-```python
-from fastapi import FastAPI, HTTPException
-import inspect
-from apis import user_api, payment_api, login_api, order_api
-from pydantic import BaseModel
-
-app = FastAPI(title="API Source Registry Server")
-
-API_REGISTRY = {
-    "api_name": {"func": module.function, "method": "GET/POST/PUT/DELETE"},
-}
-
-@app.get("/source/{api_name}")
-def get_api_source(api_name: str):
-    if api_name not in API_REGISTRY:
-        raise HTTPException(status_code=404, detail="API not found")
-    source_code = inspect.getsource(API_REGISTRY[api_name]["func"])
-    return {"api_name": api_name, "source_code": source_code}
-```
-
-REQUIREMENTS:
-1. Output ONLY valid Python code - a single function that can replace the original
-2. The function should return a simple dict (not FastAPI response objects)
-3. Include necessary imports at the top of the function
-4. Implement: input validation, error handling, authentication placeholder
-5. Do NOT use hardcoded credentials - use environment variables
-6. Do NOT create FastAPI app or routes - just the function
-7. If external dependencies needed, add: ###EXTERNAL_DEPENDENCIES### and list pip packages
-8. Do NOT add explanations - ONLY code
-
-Example output format:
-```python
-def api_function():
-    # imports
-    # validation
-    # logic
-    return {"result": "value"}
-```
-"""
-
-def get_secure_code_suggestion(source_code: str, api_name: Optional[str] = None):
-    headers = {
-        "Authorization": f"Bearer {GROQ_API_KEY}",
-        "Content-Type": "application/json"
-    }
-
-    prompt = f"""You are a senior backend security engineer.
-
+def get_secure_code_suggestion(source_code: str, api_name: Optional[str] = None) -> Dict:
+    """
+    Generate secure code suggestion
+    
+    Args:
+        source_code: Original code
+        api_name: API name for context
+        
+    Returns:
+        Dict with suggested code and dependencies
+    """
+    try:
+        import requests
+        
+        headers = {
+            "Authorization": f"Bearer {GROQ_API_KEY}",
+            "Content-Type": "application/json"
+        }
+        
+        prompt = f"""You are a senior backend security engineer.
 Analyze the following API function and rewrite it to be secure.
-
-{PROJECT_CONTEXT}
 
 API NAME: {api_name if api_name else "Unknown"}
 
-Original Code to Secure:
+Original Code:
 {source_code}
 
-Generate the SECURE version of this function:"""
+Generate the SECURE version of this function:
+- Add input validation
+- Add error handling
+- Add authentication check
+- Implement proper authorization
+- Use parameterized queries if using databases
+- Add rate limiting
+- Use environment variables for secrets
+- Output ONLY valid Python code
 
-    payload = {
-        "model": MODEL_NAME,
-        "messages": [
-            {"role": "user", "content": prompt}
-        ],
-        "temperature": 0.2
-    }
-
-    try:
+Code must be production-ready and secure."""
+        
+        payload = {
+            "model": MODEL_NAME,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.2
+        }
+        
         response = requests.post(GROQ_URL, headers=headers, json=payload, timeout=60)
         if response.status_code == 200:
             result = response.json()
             content = result["choices"][0]["message"]["content"].strip()
             
-            if "###EXTERNAL_DEPENDENCIES###" in content:
-                parts = content.split("###EXTERNAL_DEPENDENCIES###")
-                code = parts[0].strip()
-                dependencies_raw = parts[1].strip() if len(parts) > 1 else ""
-                
-                dependencies = []
-                if dependencies_raw:
-                    for line in dependencies_raw.split('\n'):
-                        line = line.strip()
-                        if line.startswith('- ') or line.startswith('* '):
-                            dependencies.append(line[2:].strip())
-                        elif line.startswith('pip ') or line.startswith('pip install '):
-                            dependencies.append(line.replace('pip install ', '').replace('pip ', '').strip())
-                        elif line and not line.startswith('#'):
-                            dependencies.append(line.strip())
-                
-                return {"code": code, "dependencies": dependencies}
-            else:
-                return {"code": content, "dependencies": []}
+            return {"code": content, "dependencies": []}
         else:
-            print("Secure Code API Error:", response.status_code)
+            print(f"Error generating secure code: {response.status_code}")
             return {"code": "Secure code generation failed.", "dependencies": []}
+    
     except Exception as e:
         print(f"Error generating secure code: {e}")
         return {"code": f"Error: {str(e)}", "dependencies": []}
 
 
-# ==================================================
+# ================================================================================
 # API Endpoints
-# ==================================================
+# ================================================================================
+
+@app.route('/api/health', methods=['GET'])
+def health_check():
+    """Health check endpoint"""
+    return jsonify({
+        "status": "healthy",
+        "service": "AI Security Middleware with GitHub Integration",
+        "github_connected": github_client is not None,
+        "apis_discovered": len(cached_apis)
+    }), 200
+
+
+@app.route('/api/github/connect', methods=['POST'])
+def connect_github():
+    """
+    Connect to GitHub repository
+    
+    Request body:
+    {
+        "owner": "github_username",
+        "repo_name": "repository_name"
+    }
+    """
+    try:
+        data = request.get_json()
+        
+        # Validate input
+        is_safe, message, details = validate_request_input(data)
+        if not is_safe:
+            return jsonify({"error": message, "details": details}), 400
+        
+        owner = data.get("owner", GITHUB_REPO_OWNER)
+        repo_name = data.get("repo_name", GITHUB_REPO_NAME)
+        
+        # Initialize GitHub client
+        global github_client
+        github_client = initialize_github_client(owner, repo_name)
+        
+        if github_client is None:
+            return jsonify({
+                "error": f"Failed to connect to repository {owner}/{repo_name}"
+            }), 400
+        
+        repo_info = github_client.get_repository_structure()
+        
+        return jsonify({
+            "status": "success",
+            "message": "Connected to GitHub repository",
+            "repository": repo_info
+        }), 200
+    
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/discover', methods=['POST'])
+def discover_apis():
+    """
+    Discover APIs from GitHub repository
+    
+    Request body:
+    {
+        "owner": "github_username",
+        "repo_name": "repository_name"
+    }
+    """
+    try:
+        data = request.get_json() if request.get_json() else {}
+        
+        # Validate input
+        is_safe, message, details = validate_request_input(data)
+        if not is_safe:
+            return jsonify({"error": message, "details": details}), 400
+        
+        owner = data.get("owner", GITHUB_REPO_OWNER)
+        repo_name = data.get("repo_name", GITHUB_REPO_NAME)
+        
+        print(f"\n🔄 Discovering APIs from {owner}/{repo_name}...")
+        
+        # Discover APIs
+        apis = discover_apis_from_github(owner, repo_name)
+        
+        if not apis:
+            return jsonify({
+                "message": "No APIs found in repository",
+                "apis": []
+            }), 200
+        
+        # Analyze each API
+        api_list = []
+        for api in apis:
+            score = get_security_score(api.source_code)
+            
+            api_list.append({
+                "name": api.name,
+                "function_name": api.function_name,
+                "endpoint": api.endpoint,
+                "http_method": api.http_method,
+                "language": api.language,
+                "framework": api.framework,
+                "file_path": api.file_path,
+                "parameters": [
+                    {
+                        "name": p.name,
+                        "type": p.type_hint,
+                    } for p in api.parameters
+                ],
+                "security_score": score if score else 0,
+                "status": "Active" if score and score >= 60 else "Danger"
+            })
+        
+        summary = api_analyzer.get_api_summary()
+        
+        return jsonify({
+            "status": "success",
+            "message": f"Discovered {len(apis)} APIs",
+            "repository": f"{owner}/{repo_name}",
+            "total_apis": len(apis),
+            "apis_by_method": summary.get("apis_by_method"),
+            "apis_by_language": summary.get("apis_by_language"),
+            "apis_by_framework": summary.get("apis_by_framework"),
+            "language_statistics": summary.get("language_statistics"),
+            "apis": api_list
+        }), 200
+    
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 
 @app.route('/api/list', methods=['GET'])
 def list_apis():
     """
-    Returns the list of available APIs from the test server with security scores.
+    List all discovered APIs
+    
+    Optionally specify an owner and repo_name to discover from GitHub
+    Query parameters:
+    - owner: Repository owner (optional)
+    - repo_name: Repository name (optional)
     """
-    data = fetch_api_list()
-    if "error" in data and not data.get("apis"):
-        return jsonify({"error": data["error"], "apis": []}), 200
+    try:
+        owner = request.args.get("owner")
+        repo_name = request.args.get("repo_name")
+        
+        # If owner and repo specified, discover APIs first
+        if owner and repo_name:
+            apis = discover_apis_from_github(owner, repo_name)
+        else:
+            apis = cached_apis
+        
+        if not apis:
+            return jsonify({"apis": []}), 200
+        
+        api_list = []
+        for api in apis:
+            score = get_security_score(api.source_code)
+            api_list.append({
+                "name": api.name,
+                "endpoint": api.endpoint,
+                "http_method": api.http_method,
+                "language": api.language,
+                "framework": api.framework,
+                "file_path": api.file_path,
+                "security_score": score if score else 0,
+                "status": "Active" if score and score >= 60 else "Danger",
+                "parameters": [
+                    {"name": p.name, "type": p.type_hint}
+                    for p in api.parameters
+                ]
+            })
+        
+        return jsonify({
+            "total_apis": len(api_list),
+            "apis": api_list
+        }), 200
     
-    apis = data.get("apis", [])
-    
-    for api in apis:
-        api_name = api.get("apiKey")
-        if api_name:
-            source_data = fetch_api_source(api_name)
-            if "source_code" in source_data:
-                score = get_security_score(source_data["source_code"])
-                api["score"] = score if score else 0
-                api["status"] = "Active" if score and score >= 60 else "Danger"
-            else:
-                api["score"] = 0
-                api["status"] = "Danger"
-    
-    return jsonify({"apis": apis}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
-@app.route('/api/analyze/<api_name>', methods=['GET'])
+@app.route('/api/analyze/<api_name>', methods=['GET', 'POST'])
 def analyze_api(api_name):
     """
-    Analyzes an API for security vulnerabilities.
+    Analyze an API for security vulnerabilities
     
     Returns:
     {
@@ -246,45 +517,122 @@ def analyze_api(api_name):
         "endpoint": str,
         "source_code": str,
         "security_score": int (0-100),
-        "suggested_code": str (only if score < 70),
+        "parameters": list,
+        "suggested_code": str (if score < 70),
         "needs_improvement": bool
     }
     """
     try:
-        # Fetch API source from test server
-        data = fetch_api_source(api_name)
+        # Validate input
+        if request.method == 'POST':
+            data = request.get_json() if request.get_json() else {}
+            is_safe, message, details = validate_request_input(data)
+            if not is_safe:
+                return jsonify({"error": message, "details": details}), 400
         
-        if "error" in data:
-            return jsonify({"error": f"Could not fetch API source: {data['error']}"}), 404
+        # Find the API
+        api = api_analyzer.get_api_by_name(api_name)
         
-        source_code = data.get("source_code", "")
-        
-        if not source_code:
-            return jsonify({"error": "No source code found"}), 404
+        if not api:
+            return jsonify({
+                "error": f"API '{api_name}' not found. Total APIs: {len(cached_apis)}"
+            }), 404
         
         # Get security score
-        score = get_security_score(source_code)
+        score = get_security_score(api.source_code)
         if score is None:
-            return jsonify({"error": "Failed to analyze security score"}), 500
+            score = 60  # Default fallback score
         
         # Generate suggested code if score is low
         suggested_code = None
         suggested_dependencies = []
         if score < 70:
-            result = get_secure_code_suggestion(source_code, api_name)
+            result = get_secure_code_suggestion(api.source_code, api_name)
             suggested_code = result.get("code", "")
             suggested_dependencies = result.get("dependencies", [])
         
         return jsonify({
-            "api_name": api_name,
-            "endpoint": f"/api/v1/{api_name}",
-            "source_code": source_code,
+            "api_name": api.name,
+            "function_name": api.function_name,
+            "endpoint": api.endpoint,
+            "http_method": api.http_method,
+            "file_path": api.file_path,
+            "source_code": api.source_code,
+            "parameters": [
+                {
+                    "name": p.name,
+                    "type": p.type_hint,
+                } for p in api.parameters
+            ],
             "security_score": score,
             "suggested_code": suggested_code,
             "suggested_dependencies": suggested_dependencies,
             "needs_improvement": score < 70,
-            "severity": "Critical" if score < 50 else "High" if score < 70 else "Medium" if score < 85 else "Low"
+            "severity": (
+                "Critical" if score < 50 else
+                "High" if score < 70 else
+                "Medium" if score < 85 else
+                "Low"
+            )
         }), 200
+    
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/analyze-input', methods=['POST'])
+def analyze_input_data():
+    """
+    Check input data for security threats
+    
+    Request body:
+    {
+        "data": any (string, dict, list, etc)
+    }
+    """
+    try:
+        json_data = request.get_json()
+        if not json_data:
+            return jsonify({"error": "No data provided"}), 400
+        
+        input_data = json_data.get("data")
+        
+        is_safe, threat_level, threats = threat_detector.analyze_input(input_data)
+        
+        return jsonify({
+            "is_safe": is_safe,
+            "threat_level": threat_level.value,
+            "threats_count": len(threats),
+            "threats": threats[:10]  # Return top 10 threats
+        }), 200
+    
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/validate-request', methods=['POST'])
+def validate_request():
+    """
+    Validate entire request for threats
+    
+    Request body can be anything - will be scanned for security threats
+    """
+    try:
+        data = request.get_json() if request.get_json() else {}
+        
+        is_safe, message, details = validate_request_input(data)
+        
+        if is_safe:
+            return jsonify({
+                "valid": True,
+                "message": "Request is safe to process"
+            }), 200
+        else:
+            return jsonify({
+                "valid": False,
+                "message": message,
+                "details": details
+            }), 400
     
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -293,7 +641,7 @@ def analyze_api(api_name):
 @app.route('/api/batch-analyze', methods=['POST'])
 def batch_analyze():
     """
-    Analyzes multiple APIs at once.
+    Analyze multiple APIs at once
     
     Request body:
     {
@@ -302,36 +650,41 @@ def batch_analyze():
     """
     try:
         data = request.get_json()
+        
+        # Validate input
+        is_safe, message, details = validate_request_input(data)
+        if not is_safe:
+            return jsonify({"error": message, "details": details}), 400
+        
         api_names = data.get("api_names", [])
         
         results = []
         for api_name in api_names:
-            api_data = fetch_api_source(api_name)
-            if "error" not in api_data:
-                source_code = api_data.get("source_code", "")
+            api = api_analyzer.get_api_by_name(api_name)
+            if api:
+                source_code = api.source_code
                 score = get_security_score(source_code)
                 
                 results.append({
                     "api_name": api_name,
+                    "endpoint": api.endpoint,
                     "security_score": score,
                     "needs_improvement": score < 70 if score else False
                 })
         
-        return jsonify({"analyses": results}), 200
+        return jsonify({
+            "total_analyzed": len(results),
+            "analyses": results
+        }), 200
     
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 
-@app.route('/api/health', methods=['GET'])
-def health_check():
-    """Health check endpoint"""
-    return jsonify({"status": "healthy", "service": "AI Security Middleware"}), 200
-
-
-# ==================================================
+# ================================================================================
 # Error Handlers
-# ==================================================
+# ================================================================================
+
 @app.errorhandler(404)
 def not_found(error):
     return jsonify({"error": "Endpoint not found"}), 404
@@ -342,16 +695,143 @@ def internal_error(error):
     return jsonify({"error": "Internal server error"}), 500
 
 
-# ==================================================
+# ================================================================================
+# API Request Middleware - Intercepts and Validates Requests
+# ================================================================================
+
+@app.route('/api/proxy/<path:api_path>', methods=['GET', 'POST', 'PUT', 'DELETE', 'PATCH'])
+def api_proxy(api_path):
+    """
+    Middleware that intercepts all API requests
+    
+    1. Validates request data for security threats
+    2. Blocks requests with detected threats
+    3. Forwards safe requests to actual backend
+    4. Returns backend response to frontend
+    
+    Request body (for POST/PUT):
+    {
+        "data": {...request data...}
+    }
+    
+    Response:
+    {
+        "status": "success" or "blocked",
+        "message": "description",
+        "data": {...response from backend...} (if success)
+        "threat_details": {...} (if blocked)
+    }
+    """
+    try:
+        # Extract request data
+        request_data = {}
+        if request.method in ['POST', 'PUT']:
+            request_data = request.get_json() if request.get_json() else {}
+        elif request.method == 'GET':
+            request_data = request.args.to_dict()
+        
+        print(f"\n🔒 [MIDDLEWARE] {request.method} /api/{api_path}")
+        print(f"   Request data: {str(request_data)[:100]}...")
+        
+        # ========================================================================
+        # THREAT DETECTION - Block dangerous requests
+        # ========================================================================
+        try:
+            threat_detector.detect_threats(request_data)
+            print(f"   ✅ Threat check passed")
+        except ThreatDetectedError as e:
+            print(f"   ❌ THREAT DETECTED: {e}")
+            return jsonify({
+                "status": "blocked",
+                "message": "Request blocked: Security threat detected",
+                "threat_type": str(e.threat_level),
+                "threat_details": e.details,
+                "reason": str(e)
+            }), 403  # Forbidden
+        
+        # ========================================================================
+        # SAFE REQUEST - Forward to actual backend
+        # ========================================================================
+        try:
+            import requests
+            
+            # Build the actual backend URL
+            backend_url = f"{ACTUAL_BACKEND_URL}/api/{api_path}"
+            
+            # Prepare headers
+            headers = {
+                'Content-Type': 'application/json',
+                'User-Agent': 'AI-Security-Middleware'
+            }
+            
+            print(f"   📤 Forwarding to: {backend_url}")
+            
+            # Forward request to actual backend
+            if request.method == 'GET':
+                response = requests.get(backend_url, params=request_data, headers=headers, timeout=30)
+            elif request.method == 'POST':
+                response = requests.post(backend_url, json=request_data, headers=headers, timeout=30)
+            elif request.method == 'PUT':
+                response = requests.put(backend_url, json=request_data, headers=headers, timeout=30)
+            elif request.method == 'DELETE':
+                response = requests.delete(backend_url, json=request_data, headers=headers, timeout=30)
+            elif request.method == 'PATCH':
+                response = requests.patch(backend_url, json=request_data, headers=headers, timeout=30)
+            
+            # Forward the response from backend to frontend
+            print(f"   ✅ Response: {response.status_code}")
+            
+            return response.json(), response.status_code
+            
+        except requests.exceptions.ConnectionError:
+            print(f"   ❌ Backend unreachable: {ACTUAL_BACKEND_URL}")
+            return jsonify({
+                "status": "error",
+                "message": "Backend service unavailable",
+                "backend_url": ACTUAL_BACKEND_URL
+            }), 503
+        except requests.exceptions.Timeout:
+            print(f"   ❌ Backend timeout")
+            return jsonify({
+                "status": "error",
+                "message": "Backend request timeout"
+            }), 504
+        except Exception as backend_error:
+            print(f"   ❌ Backend error: {backend_error}")
+            return jsonify({
+                "status": "error",
+                "message": f"Backend error: {str(backend_error)}"
+            }), 500
+    
+    except Exception as e:
+        print(f"   ❌ Middleware error: {e}")
+        return jsonify({
+            "status": "error",
+            "message": f"Middleware error: {str(e)}"
+        }), 500
+
+
+# ================================================================================
 # Main
-# ==================================================
+# ================================================================================
+
 if __name__ == "__main__":
     if not GROQ_API_KEY:
-        print("⚠️ GROQ_API_KEY not set. Please configure environment variable.")
-        exit()
+        print("⚠️ GROQ_API_KEY not set. Please configure in .env file")
     
-    print("🚀 Starting AI Security Middleware Server...")
-    print("📡 Backend API running on http://localhost:5000")
-    print("🔗 Test Server (source APIs) should be running on http://localhost:8000")
+    if not GITHUB_TOKEN:
+        print("⚠️ GITHUB_TOKEN not set. Public API rate limits will apply")
     
-    app.run(debug=True, host='0.0.0.0', port=5000)
+    print(f"📦 GitHub Repo: {GITHUB_REPO_OWNER}/{GITHUB_REPO_NAME}")
+    print("🚀 Starting AI Security Middleware with GitHub Integration")
+    print("📍 Server running on: http://localhost:5000")
+    print("🔍 Endpoints:")
+    print("   - POST /api/github/connect - Connect to GitHub repo")
+    print("   - POST /api/discover - Discover APIs from GitHub")
+    print("   - GET /api/list - List discovered APIs")
+    print("   - GET/POST /api/analyze/<api_name> - Analyze specific API")
+    print("   - POST /api/analyze-input - Check input for threats")
+    print("   - POST /api/validate-request - Validate request")
+    print("   - GET /api/health - Health check")
+    
+    app.run(debug=True, host="0.0.0.0", port=5000)
