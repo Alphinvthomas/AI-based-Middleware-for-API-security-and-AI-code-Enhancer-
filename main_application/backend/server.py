@@ -7,6 +7,8 @@ import sys
 import re
 from typing import Optional, Dict, List
 from pathlib import Path
+from datetime import datetime
+from collections import deque
 
 # Load environment variables from root .env file FIRST
 env_path = Path(__file__).parent.parent.parent / '.env'
@@ -57,6 +59,7 @@ api_analyzer = APIAnalyzer()
 threat_detector = ThreatDetector(strict_mode=True)
 cached_apis: List[DiscoveredAPI] = []
 cached_file_contents: Dict[str, str] = {}
+api_logs: deque = deque(maxlen=1000)  # Keep last 1000 API hits
 
 
 # ================================================================================
@@ -682,6 +685,113 @@ def batch_analyze():
 
 
 # ================================================================================
+# API Logs Endpoint
+# ================================================================================
+
+@app.route('/api/logs', methods=['GET'])
+def get_api_logs():
+    """
+    Retrieve API request logs
+    
+    Query parameters:
+    - limit: Number of logs to return (default: 100)
+    - status: Filter by status ('accepted' or 'rejected', optional)
+    - api_path: Filter by API path (optional)
+    
+    Response:
+    {
+        "total": total count,
+        "logs": [
+            {
+                "timestamp": "2026-04-15T10:30:45.123456",
+                "api_path": "login",
+                "method": "POST",
+                "status": "accepted|rejected",
+                "reason": "description"
+            }
+        ]
+    }
+    """
+    try:
+        limit = int(request.args.get('limit', 100))
+        status_filter = request.args.get('status', None)
+        api_path_filter = request.args.get('api_path', None)
+        
+        # Get all logs
+        all_logs = list(api_logs)
+        
+        # Reverse to show newest first
+        all_logs.reverse()
+        
+        # Apply filters
+        filtered_logs = all_logs
+        
+        if status_filter:
+            filtered_logs = [log for log in filtered_logs if log.get('status') == status_filter]
+        
+        if api_path_filter:
+            filtered_logs = [log for log in filtered_logs if api_path_filter.lower() in log.get('api_path', '').lower()]
+        
+        # Apply limit
+        filtered_logs = filtered_logs[:limit]
+        
+        return jsonify({
+            "total": len(all_logs),
+            "filtered": len(filtered_logs),
+            "logs": filtered_logs
+        }), 200
+    
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/logs/stats', methods=['GET'])
+def get_logs_stats():
+    """
+    Get statistics about API logs
+    
+    Response:
+    {
+        "total_requests": total,
+        "accepted": count,
+        "rejected": count,
+        "apis": {
+            "api_name": {"total": count, "accepted": count, "rejected": count}
+        }
+    }
+    """
+    try:
+        all_logs = list(api_logs)
+        
+        total = len(all_logs)
+        accepted = sum(1 for log in all_logs if log.get('status') == 'accepted')
+        rejected = sum(1 for log in all_logs if log.get('status') == 'rejected')
+        
+        # Group by API path
+        apis = {}
+        for log in all_logs:
+            api_path = log.get('api_path', 'unknown')
+            if api_path not in apis:
+                apis[api_path] = {'total': 0, 'accepted': 0, 'rejected': 0}
+            
+            apis[api_path]['total'] += 1
+            if log.get('status') == 'accepted':
+                apis[api_path]['accepted'] += 1
+            elif log.get('status') == 'rejected':
+                apis[api_path]['rejected'] += 1
+        
+        return jsonify({
+            "total_requests": total,
+            "accepted": accepted,
+            "rejected": rejected,
+            "apis": apis
+        }), 200
+    
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# ================================================================================
 # Error Handlers
 # ================================================================================
 
@@ -739,8 +849,30 @@ def api_proxy(api_path):
         try:
             threat_detector.detect_threats(request_data)
             print(f"   ✅ Threat check passed")
+            
+            # Log accepted request
+            log_entry = {
+                "timestamp": datetime.now().isoformat(),
+                "api_path": api_path,
+                "method": request.method,
+                "status": "accepted",
+                "reason": "Passed threat detection"
+            }
+            api_logs.append(log_entry)
+            
         except ThreatDetectedError as e:
             print(f"   ❌ THREAT DETECTED: {e}")
+            
+            # Log rejected request
+            log_entry = {
+                "timestamp": datetime.now().isoformat(),
+                "api_path": api_path,
+                "method": request.method,
+                "status": "rejected",
+                "reason": str(e)
+            }
+            api_logs.append(log_entry)
+            
             return jsonify({
                 "status": "blocked",
                 "message": "Request blocked: Security threat detected",

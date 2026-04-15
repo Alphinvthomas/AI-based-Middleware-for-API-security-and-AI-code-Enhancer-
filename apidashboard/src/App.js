@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react';
+import Logs from './Logs';
 
 const SC = s => typeof s === 'number' 
   ? s >= 80 ? 'text-emerald-400' : s >= 60 ? 'text-amber-400' : 'text-red-400'
@@ -34,6 +35,7 @@ function App() {
   const [loading, setLoading] = useState(false);
   const [discoveryStatus, setDiscoveryStatus] = useState('');
   const [stats, setStats] = useState({ total: 0, active: 0, danger: 0, languages: {} });
+  const [currentPage, setCurrentPage] = useState('dashboard'); // 'dashboard' or 'logs'
 
   // Parse and auto-discover on load and when repo changes
   useEffect(() => {
@@ -132,6 +134,33 @@ function App() {
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100 font-mono">
       <div className="max-w-6xl mx-auto p-8">
+        {/* Navigation Tabs */}
+        <div className="mb-8 flex gap-4 border-b border-slate-800">
+          <button
+            onClick={() => setCurrentPage('dashboard')}
+            className={`px-6 py-3 font-medium transition-colors border-b-2 ${
+              currentPage === 'dashboard'
+                ? 'border-emerald-500 text-emerald-400'
+                : 'border-transparent text-slate-400 hover:text-slate-300'
+            }`}
+          >
+            📊 Dashboard
+          </button>
+          <button
+            onClick={() => setCurrentPage('logs')}
+            className={`px-6 py-3 font-medium transition-colors border-b-2 ${
+              currentPage === 'logs'
+                ? 'border-emerald-500 text-emerald-400'
+                : 'border-transparent text-slate-400 hover:text-slate-300'
+            }`}
+          >
+            📋 Request Logs
+          </button>
+        </div>
+
+        {/* Dashboard Page */}
+        {currentPage === 'dashboard' ? (
+          <>
         <header className="mb-10">
           <div className="flex items-center gap-3 mb-2">
             <div className="w-3 h-3 rounded-full bg-emerald-500 animate-pulse"></div>
@@ -298,6 +327,10 @@ function App() {
               </div>
             </div>
           </div>
+        )}
+          </>
+        ) : (
+          <Logs />
         )}
       </div>
     </div>
